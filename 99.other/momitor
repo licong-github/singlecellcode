@@ -1,0 +1,318 @@
+#!/usr/bin/perl -w
+###################################  
+##  Author : licong  
+##  Version : 1.0(2018/01/15)  
+##  E-mail : lc@xkybio.com  
+####################################
+use strict;
+use FindBin '$Bin';
+use Cwd 'abs_path';
+use Getopt::Long;
+use Net::SMTP;
+use Encode;
+use MIME::Base64;
+my($sleep,$submit_times,$list,$max_run,$mem,$cpu,$cf_file,$mail_to,@line,%log);
+GetOptions(
+	"list:s" => \$list,
+	"submit_times:i" => \$submit_times,
+	"max_run:i" => \$max_run,
+	"update_interval:i" => \$sleep,
+	"cpu:i" => \$cpu,
+	"mem:i" => \$mem,
+	"mail_conf:s" => \$cf_file,
+	"mail_to:s" => \$mail_to
+);
+if($ARGV[1]){
+	$list ||=$ARGV[1] if($ARGV[0] eq 'kill' || $ARGV[0] eq 'submit' || $ARGV[0] eq 'log');
+}
+$list ||=$ARGV[0] if($ARGV[0] && not $ARGV[0] eq 'stat');
+
+#stat 打印用户所有项目信息
+if($ARGV[0] && $ARGV[0] eq "stat"){
+	my $tmpn=`ls ~/monitor/ |wc -l`;
+	if($tmpn == 0){
+		print "\nThere is no monitor project!!\n\n";
+		exit;
+	}
+	my $tmp=`cat ~/monitor/*`;
+	print $tmp;
+	exit;
+}
+if (@ARGV == 0 && !$list) {
+        die <<USAGE;
+==================================================================================
+Description: submit and monitor task
+
+Options for submit :
+	-list    		monitor relation file, must be abspath
+	-submit_times    	resubmit times [2]
+	-max_run	    	max jobs on running [500]
+	-update_interval    	update interval. [20] second
+	-cpu			max cpu use  [90] %
+	-mem			lest memory rest [30] G
+	-mail_conf		mail.conf file with Email account and password 
+	-mail_to		user Email address
+	
+submit:
+        perl $0 submit /hdd/public/lc/pipeline/RNAseq/example/result/All.monitor.txt
+kill:
+        perl $0 kill /hdd/public/lc/pipeline/RNAseq/example/result/All.monitor.txt
+log:
+        perl $0 log /hdd/public/lc/pipeline/RNAseq/example/result/All.monitor.txt
+stat:
+        perl $0 stat
+==================================================================================
+USAGE
+}
+die "list must be abs path!!" unless($list =~/^\//);
+
+#log 打印所有脚本状态
+if($ARGV[0] && $ARGV[0] eq "log" && $list){
+	my $tmp=`cat $list.log*`;
+	print $tmp;
+	exit;
+}
+
+my(%left,%rigth,%all,$monitor_pid,$user);
+$sleep ||=20; #设置更新时间 20秒更新一次
+$cpu ||=90;
+$mem ||=30;
+$submit_times ||=2; #设置投递次数，超过3次则认为脚本报错，不再重投
+my $nerro=$submit_times-1;
+$max_run ||=500; #设置最多同时运行多少个脚本
+my $name=$list;
+$name=~s/\//#/g;
+
+`mkdir -p ~/monitor`;
+chomp($user=`who i am|awk '{print \$1}'`);
+chomp(my $mo=`ps -ef|grep $list|grep -v grep|grep -v  kill`);
+print $mo;
+if($mo){
+	$monitor_pid=(split /\s+/,$mo)[1];
+	$user||=(split /\s+/,$mo)[0];
+}
+open IN,"$list";   ### dependece file
+while(<IN>){
+	chomp;
+	$_=~s/:\d+G//g; #lc
+	$_=~s/:\d\.\d+G//g; #lc
+	$_=~s/:\d+cpu//g;
+	my @a=split /\t/;
+	die "$a[0] not exists !!" unless(-f $a[0]);
+	$left{$a[0]}=1;
+	if(@a >1){
+		$rigth{$a[1]}.="\t$a[0]";
+		$all{$a[1]}=0;
+		die "$a[0] not exists !!" unless(-f $a[0]);
+		die "$a[1] not exists !!" unless(-f $a[1]);
+	}
+	$all{$a[0]}=0;
+}
+close IN;
+
+#kill 杀掉此项目及其所有任务
+if($ARGV[0] && $ARGV[0] eq "kill"){
+	`kill -9 $monitor_pid` if($monitor_pid);
+	foreach my $j(keys %all){
+		my $n=`ps -ef|grep '$j'|grep -v grep`;
+		if($n){
+			my $pid=(split /\s+/,$n)[1];
+			`ps -sef >$list.ps`;
+			my @kill=get_pid("$list.ps",$pid);  #获取任务及其子任务的pid
+			for(@kill){
+				`kill -9 $_`;
+			}
+		}
+	}
+	`rm /home/$user/monitor/$name` if(-f "/home/$user/monitor/$name");
+	exit;
+}
+
+my (@onlyleft,@onlyrigth);
+for(keys %left){
+	push @onlyleft,$_ unless($rigth{$_});
+}
+for(keys %rigth){
+	push @onlyrigth,$_ unless($left{$_});
+}
+my $a=scalar(keys %all); ##总数
+`touch /home/$user/monitor/$name`;
+
+$cf_file ||= "$Bin/mail.conf"; #邮件配置文件
+#打开配置文件和日志文件
+open CF_FILE, $cf_file or die "Open config file [$cf_file] failed! \n";
+while(<CF_FILE>){
+	chomp;
+	if($_=~/^#+/){
+		next; #跳过注释行
+	}
+	@line=split /\s+/, $_;
+	if(@line != 4){
+		next; 
+	}
+}
+close CF_FILE;
+open VFOUT,">$list.vf.$monitor_pid" or die $!;
+#print VFOUT "Time\tall_cpu_available(%)\tall_memory_available(%)\tcpu_use\tmemory_use\n"; ##
+print VFOUT "Time\tall_cpu_available(%)\tall_memory_available(%)\n";
+$log{'noerro'}=1;
+while(1){  ###暂时用sleep后台循环执行监控
+#输出资源监控日志
+chomp(my $date=`date "+%Y-%m-%d %H:%M:%S"`);
+chomp(my $cpu_use=`sar 1 1|tail -1|awk '{print \$3}'`); #需要等待一秒 后续优化
+#chomp(my $cpu_use=`top -n 1 | grep 'Cpu' |awk '{print \$2}'`); #
+my $cpu_rest_percent=100-$cpu_use;
+chomp(my $mem_rest=`free -h|grep Mem|awk '{print \$7}'`);
+$mem_rest=~s/G//;
+chomp(my $mem_all=`free -h|grep Mem|awk '{print \$2}'`);
+$mem_all=~s/G//;
+my $mem_rest_percent=($mem_rest/$mem_all)*100;
+$mem_rest_percent=sprintf "%.1f",$mem_rest_percent;
+print VFOUT "$date\t$cpu_rest_percent\t$mem_rest_percent\n";
+
+open LOG,">$list.log" or die $!; #输出运行日志
+my($p,$r,$d,$e,$h)=(0,0,0,0,0); #排队数，在跑，完成，报错，由于设置了最大脚本数目而等待的脚本数
+for(@onlyleft){
+	if($all{$_} > $nerro){
+		print LOG "erro: $_\n";
+		$e++;next;
+	}
+	if(-s "$_.sign"){
+		print LOG "done: $_\n";
+		$d++;
+		next;
+	}else{
+		if($r >= $max_run || $cpu_use > $cpu || $mem_rest < $mem){
+			$h++;
+			next;
+		}
+		print LOG "run: $_\n";
+		$r++;
+		my $n=`ps -ef|grep '$_'|grep -v grep`;
+		if($n){
+			next;
+		}else{
+			`nohup sh $_ 1>$_.o 2>$_.e &`;
+			$all{$_}++;
+		}
+	}
+}
+LEBEL: foreach my $ri(keys %rigth){
+	if($all{$ri} > $nerro){
+		print LOG "erro: $ri\n";
+		$e++;next;
+	}
+	if(-s "$ri.sign"){
+		print LOG "done: $ri\n";
+		$d++;next;
+	}else{
+		$rigth{$ri}=~s/^\t+//;
+		my @a=split /\t+/,$rigth{$ri};
+		for(@a){
+			unless(-s "$_.sign"){
+				print LOG "pend: $ri\n";
+				$p++;next LEBEL;
+			}
+		}
+		
+		my $n=`ps -ef|grep '$ri'|grep -v grep`;
+		if($n){
+			print LOG "run: $ri\n";
+			$r++;
+			next;
+		}else{
+			if($r >= $max_run || $cpu_use > $cpu || $mem_rest < $mem){
+				$h++;
+				next;
+			}
+			print LOG "run: $ri\n";
+			$r++;
+			`nohup sh $ri 1>$ri.o 2>$ri.e &`;
+			$all{$ri}++;
+		}
+	}
+}
+open OUT,">$list.state" or die $!; #输出运行监控
+print OUT "$list\nPend\tHold\tRun\tDone\tErro\tTotal\n$p\t$h\t$r\t$d\t$e\t$a\n\n";
+close OUT;
+open OUT2,">/home/$user/monitor/$name" or die $!; #输出运行监控到home目录
+print OUT2 "$list\nPend\tHold\tRun\tDone\tErro\tTotal\n$p\t$h\t$r\t$d\t$e\t$a\n\n";
+close OUT2;
+close LOG;
+my $stat=$e+$d;
+
+if($e > 0 && $log{'noerro'}){
+	$log{'noerro'}=0;
+	if($mail_to){
+		send_mail($line[0], $line[1], $line[2], $mail_to,"Project Erro, please check !!\n\n\t$list\n");
+	}
+}
+if($d == $a){
+	if($mail_to){
+		send_mail($line[0], $line[1], $line[2], $mail_to,"Project Finish, \n\n\t$list\n"); 
+	}
+}
+my $pde=$p+$d+$e;
+if($pde == $a){
+	if($mail_to){
+		send_mail($line[0], $line[1], $line[2], $mail_to,"Project Finish, but some erro script and their dependent script should be deal,  \n\n\t$list\n"); #host from password
+	}
+}
+last if($stat == $a || $d == $a || $pde == $a); #执行完或者除了报错其他执行完时退出
+sleep($sleep);
+} ###后台执行监控循环部分
+close VFOUT;
+
+sub send_mail {
+	my($host, $auth, $password, $to, $mail_body) = @_;
+	my $smtp = Net::SMTP->new(
+		Host    =>  $host,
+		Timeout =>  30,
+	);
+	my $head=(split /,/,$mail_body)[0];
+	$smtp->command('AUTH LOGIN')->response();
+	my $userpass = encode_base64($auth);
+	$userpass =~ s/\n//g;
+	$smtp->command($userpass)->response();    
+	$userpass = encode_base64($password);
+	$userpass =~ s/\n//g;
+	$smtp->command($userpass)->response();
+	$smtp->mail($auth);
+	$smtp->to($to);
+	$smtp->bcc($auth);
+	$smtp->data();
+	$smtp->datasend("Content-Type:text/plain;charset=GB2312\n");
+	$smtp->datasend("Content-Transfer-Encoding:base64\n");
+	$smtp->datasend("From:$auth \n");
+	$smtp->datasend("To:$to \n");
+	$smtp->datasend("Subject:=?gb2312?B?".encode_base64($head,'')."?=\n\n");
+	$smtp->datasend("\n");
+ 
+	$smtp->datasend(encode_base64($mail_body,'')." \n");
+	$smtp->dataend();
+	$smtp->quit;
+}
+
+sub get_pid {
+	my ($file,$old_pid) = @_;
+	my @id;my @a;
+	push @id,$old_pid;
+	open IN,"$file";
+	while(<IN>){
+		my @a=split /\s+/,$_,11;
+		if($a[2] eq $old_pid){
+			while(<IN>){
+				my @b=split /\s+/,$_,11;
+				if($b[10]=~/^\\/){
+					push @id,"$b[2]";
+				}else{
+					last;
+				}
+			}
+			last;
+		}
+	}
+	close IN;
+	return @id;
+	
+}
